@@ -3,6 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 from Chatops import run, config
 import json
 import pymysql
+import sqlalchemy as db
 
 
 @csrf_exempt
@@ -11,13 +12,16 @@ def index(request):
     if 'build' in data:
 
         """connect mysql database"""
-        db = pymysql.connect(config.DB_URL, config.DB_USER, config.DB_PASSWORD, config.DB_NAME, port=config.DB_PORT)
-        cursor = db.cursor()
+        connection_string = f'mysql+pymysql://{config.DB_USER}:{config.DB_PASSWORD}@{config.DB_URL}/{config.DB_NAME}'
+        engine = db.create_engine(connection_string)
+        connection = engine.connect()
+        metadata = db.MetaData()
 
         """Get all user"""
-        query_f = f'select channel_id from user_botuser'
-        cursor.execute(query_f)
-        users = cursor.fetchall()
+        table_botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+        query_f = db.select([table_botuser.columns.channel_id])
+        resultproxy = connection.execute(query_f)
+        users = resultproxy.fetchall()
 
         build = data['build']
         project_name = build['project_name'].split('/')[-1]

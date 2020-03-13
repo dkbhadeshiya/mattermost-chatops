@@ -6,11 +6,11 @@ import asyncio
 import threading
 import boto3
 import boto3.session
-import pymysql
 import requests
 from datetime import datetime
 from botocore.exceptions import ClientError
 from threading import Lock
+import sqlalchemy as db
 
 """Send codeship notification to the user"""
 
@@ -55,12 +55,12 @@ def reject_request(channel_id, reject_person, instance_name, type):
 """Check Permission the user is able to scale the instance or not"""
 
 
-def check_permission(user_id, instance_name, channel_id, message, instance_type, type, db):
-    cursor = db.cursor()
-
-    query_f = f'select id,name from user_instance where name="{instance_name}"'
-    cursor.execute(query_f)
-    instances = cursor.fetchall()
+def check_permission(user_id, instance_name, channel_id, message, instance_type, type, engine, connection):
+    metadata = db.MetaData()
+    table_instances = db.Table('user_instance', metadata, autoload=True, autoload_with=engine)
+    query_f = db.select([table_instances.columns.id, table_instances.columns.name]).where(table_instances.columns.name == instance_name)
+    resultproxy = connection.execute(query_f)
+    instances = resultproxy.fetchall()
 
     try:
         instance_id = instances[0][0]
@@ -70,30 +70,38 @@ def check_permission(user_id, instance_name, channel_id, message, instance_type,
             'message': "Instance name is not found."})
         return
 
-    query_f = f'select manager_id_id from user_manager where instance_id_id="{instance_id}"'
-    cursor.execute(query_f)
-    managers = cursor.fetchall()
+    table_manager = db.Table('user_manager', metadata, autoload=True, autoload_with=engine)
+    query_f = db.select([table_manager.columns.manager_id_id]).where(table_manager.columns.instance_id_id == instance_id)
+    resultproxy = connection.execute(query_f)
+    managers = resultproxy.fetchall()
+
     managers_id = []
     for manager in managers:
         managers_id.append(manager[0])
-    query_f = f'select id,name from user_botuser where user_id="{user_id}"'
-    cursor.execute(query_f)
-    users = cursor.fetchall()
+
+    table_botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+    query_f = db.select([table_botuser.columns.id, table_botuser.columns.name]).where(table_botuser.columns.user_id == user_id)
+    resultproxy = connection.execute(query_f)
+    users = resultproxy.fetchall()
+
     user = users[0][0]
     user_name = users[0][1]
     if managers and user not in managers_id:
-        query_i = f'insert into user_instanceoperation(requested_user_id, message, channel_id, status, created_date) ' \
-                  f'values ("{user}", "{message}", "{channel_id}", "Pending", "{datetime.utcnow()}") '
-        cursor.execute(query_i)
-        db.commit()
-        request_id = cursor.lastrowid
+
+        table_instanceoperation = db.Table('user_instanceoperation', metadata, autoload=True, autoload_with=engine)
+        query_i = table_instanceoperation.insert().values(requested_user_id=user, message=message,
+                                                          channel_id=channel_id, status="Pending",
+                                                          created_date=datetime.utcnow())
+        row = connection.execute(query_i)
+        request_id = row.lastrowid
+
         manager_set = set()
         for item in managers_id:
             manager_set.add(str(item))
-        manager_set = str(manager_set).replace('{', '(').replace('}', ')')
-        query_f = f"select id,channel_id from user_botuser where id in {manager_set}"
-        cursor.execute(query_f)
-        send_request = cursor.fetchall()
+
+        query_f = db.select([table_botuser.columns.id, table_botuser.columns.channel_id], table_botuser.columns.id.in_(manager_set))
+        resultproxy = connection.execute(query_f)
+        send_request = resultproxy.fetchall()
 
         if type == 'scale_instance':
             for item in send_request:
@@ -270,24 +278,28 @@ def check_permission(user_id, instance_name, channel_id, message, instance_type,
 
         return False
     else:
-        query_i = f'insert into user_instanceoperation(requested_user_id, message, channel_id, status, created_date, ' \
-                  f'response_by_id, response_date) values ("{user}", "{message}", "{channel_id}", "Ac' \
-                  f'cepted", "{datetime.utcnow()}", "{user}", "{datetime.utcnow()}") '
-        cursor.execute(query_i)
-        db.commit()
+        table_instanceoperation = db.Table('user_instanceoperation', metadata, autoload=True, autoload_with=engine)
+        query_i = table_instanceoperation.insert().values(requested_user_id=user, message=message,
+                                                          channel_id=channel_id, status="Accepted",
+                                                          created_date=datetime.utcnow(), response_by_id=user,
+                                                          response_date=datetime.utcnow())
+        connection.execute(query_i)
+
         return True
 
 
 """Check project config in database or not"""
 
 
-def check_project(project_name, db):
-    cursor = db.cursor()
+def check_project(project_name, engine, connection):
 
     """Get all project from database"""
-    query_f = f'select codeship_project_name, gitlab_project_id from user_project'
-    cursor.execute(query_f)
-    projects = cursor.fetchall()
+    metadata = db.MetaData()
+    table_project = db.Table('user_project', metadata, autoload=True, autoload_with=engine)
+    query_f = db.select([table_project.columns.codeship_project_name, table_project.columns.gitlab_project_id])
+    resultproxy = connection.execute(query_f)
+    projects = resultproxy.fetchall()
+
     for project in projects:
         if project[0] == project_name:
             return project[1]
@@ -297,19 +309,22 @@ def check_project(project_name, db):
 """Notify the instance access user"""
 
 
-def notify_stack_holders(instance_name, user_id, requested_user, status, type, db):
-    cursor = db.cursor()
+def notify_stack_holders(instance_name, user_id, requested_user, status, type, engine, connection):
 
-    query = f'select user_botuser.channel_id, user_botuser.name, user_botuser.user_id from user_instanceaccess join ' \
-            f'user_botuser on ' \
-            f'user_instanceaccess.user_id_id=user_botuser.id join user_instance on ' \
-            f'user_instance.id=user_instanceaccess.instance_id_id where user_instance.name="{instance_name}"'
-    cursor.execute(query)
-    users = cursor.fetchall()
+    metadata = db.MetaData()
+    table_botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+    table_instanceaccess = db.Table('user_instanceaccess', metadata, autoload=True, autoload_with=engine)
+    table_instance = db.Table('user_instance', metadata, autoload=True, autoload_with=engine)
 
-    query_f = f'select name from user_botuser where user_id="{user_id}"'
-    cursor.execute(query_f)
-    approve_user = cursor.fetchall()
+    join_query = table_instanceaccess.join(table_botuser, table_instanceaccess.columns.user_id_id == table_botuser.columns.id).join(table_instance, table_instanceaccess.columns.instance_id_id == table_instance.columns.id)
+    query = db.select([table_botuser.columns.channel_id, table_botuser.columns.name, table_botuser.columns.user_id]).select_from(join_query).where(table_instance.columns.name == instance_name)
+    resultproxy = connection.execute(query)
+    users = resultproxy.fetchall()
+
+    query_f = db.select([table_botuser.columns.name]).where(table_botuser.columns.user_id == user_id)
+    resultproxy = connection.execute(query_f)
+    approve_user = resultproxy.fetchall()
+
     approve_user = approve_user[0][0]
 
     if status == 'start':
@@ -396,8 +411,7 @@ def notify_stack_holders(instance_name, user_id, requested_user, status, type, d
 """Get all instance from aws"""
 
 
-def get_instance(db):
-    cursor = db.cursor()
+def get_instance(engine, connection):
 
     session = boto3.session.Session()
 
@@ -405,9 +419,12 @@ def get_instance(db):
                          aws_secret_access_key=config.aws_secret_access_key,
                          region_name=config.region_name)
 
-    q = 'select * from user_instance'
-    cursor.execute(q)
-    db_instances = cursor.fetchall()
+    metadata = db.MetaData()
+    instances = db.Table('user_instance', metadata, autoload=True, autoload_with=engine)
+    q = db.select([instances])
+    resultproxy = connection.execute(q)
+    db_instances = resultproxy.fetchall()
+
     all_instance_db = []
     for instance in db_instances:
         all_instance_db.append(instance[2])
@@ -423,15 +440,14 @@ def get_instance(db):
                         name = tag['Value']
                         break
             if instance['InstanceId'] not in all_instance_db and name:
-                insert_q = f'insert into user_instance(instance_id, name) values("{instance["InstanceId"]}", "{name}")'
-                cursor.execute(insert_q)
-                db.commit()
+                q = instances.insert().values(instance_id=instance['InstanceId'], name=name)
+                connection.execute(q)
 
 
 """scaling, starting, stopping and rebooting the instance"""
 
 
-def scale_instance(ec2client, channel_id, instance_name, instance_type, user_id, instance_id, requested_user, db):
+def scale_instance(ec2client, channel_id, instance_name, instance_type, user_id, instance_id, requested_user, engine, connection):
     try:
         ec2client.start_instances(InstanceIds=[instance_id], DryRun=True)
         ec2client.stop_instances(InstanceIds=[instance_id], DryRun=True)
@@ -450,7 +466,7 @@ def scale_instance(ec2client, channel_id, instance_name, instance_type, user_id,
         'message': f"Please wait, your instance **{instance_name}** is being scaled !"})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'scale_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'scale_instance', engine, connection)
 
     """Changing Instance Type"""
 
@@ -470,14 +486,14 @@ def scale_instance(ec2client, channel_id, instance_name, instance_type, user_id,
     waiter.wait(InstanceIds=[instance_id])
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'scale_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'scale_instance', engine, connection)
 
     d.posts.create_post(options={
         'channel_id': channel_id,
         'message': f"Your instance **{instance_name}** has been scaled successfully to **{instance_type}**"})
 
 
-def start_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, db):
+def start_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, engine, connection):
     try:
         ec2client.start_instances(InstanceIds=[instance_id], DryRun=True)
     except ClientError as e:
@@ -493,7 +509,7 @@ def start_instance(ec2client, channel_id, instance_name, user_id, instance_id, r
         'message': f"Please wait, your instance **{instance_name}** is being started :white_check_mark:"})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'start_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'start_instance', engine, connection)
 
     ec2client.start_instances(InstanceIds=[instance_id], DryRun=False)
 
@@ -504,10 +520,10 @@ def start_instance(ec2client, channel_id, instance_name, user_id, instance_id, r
         'message': f"Instance **{instance_name}** is now started :white_check_mark: "})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'start_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'start_instance', engine, connection)
 
 
-def stop_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, db):
+def stop_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, engine, connection):
     try:
         ec2client.stop_instances(InstanceIds=[instance_id], DryRun=True)
     except ClientError as e:
@@ -523,7 +539,7 @@ def stop_instance(ec2client, channel_id, instance_name, user_id, instance_id, re
         'message': f"Please wait, your instance **{instance_name}** is being stopped :stop_sign:"})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'stop_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'start', 'stop_instance', engine, connection)
 
     ec2client.stop_instances(InstanceIds=[instance_id], DryRun=False)
 
@@ -535,10 +551,10 @@ def stop_instance(ec2client, channel_id, instance_name, user_id, instance_id, re
         'message': f"Instance **{instance_name}** is now stopped :stop_sign:"})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'stop_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'stop_instance', engine, connection)
 
 
-def reboot_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, db):
+def reboot_instance(ec2client, channel_id, instance_name, user_id, instance_id, requested_user, engine, connection):
     try:
         ec2client.reboot_instances(InstanceIds=[instance_id], DryRun=True)
     except ClientError as e:
@@ -557,25 +573,25 @@ def reboot_instance(ec2client, channel_id, instance_name, user_id, instance_id, 
                    f"few minutes"})
 
     """Notify stake holders"""
-    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'reboot_instance', db)
+    notify_stack_holders(instance_name, user_id, requested_user, 'end', 'reboot_instance', engine, connection)
 
 
 """New user created in database"""
 
 
-def create_user(user_id, channel_id):
-    """Connect Mysql database"""
-    db = pymysql.connect(config.DB_URL, config.DB_USER, config.DB_PASSWORD, config.DB_NAME, port=config.DB_PORT)
-    cursor = db.cursor()
+def create_user(user_id, channel_id, engine, connection):
 
-    q = f'select * from user_botuser where user_id="{user_id}"'
-    cursor.execute(q)
-    this_user = cursor.fetchall()
+    metadata = db.MetaData()
+    botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+    query_f = db.select([botuser]).where(botuser.columns.user_id == user_id)
+    resultproxy = connection.execute(query_f)
+    this_user = resultproxy.fetchall()
+
     if not this_user:
         user = d.users.get_user(user_id=user_id)
-        q = f'insert into user_botuser(user_id, name, email, channel_id, created_date) values("{user_id}","{user["username"]}","{user["email"]}","{channel_id}", "{datetime.utcnow()}")'
-        cursor.execute(q)
-        db.commit()
+        q = botuser.insert().values(user_id=user_id, name=user['username'], email=user['email'], channel_id=channel_id,
+                                    created_date=datetime.utcnow())
+        connection.execute(q)
 
 
 """handle all messages intent and according to that send responses to the users"""
@@ -583,8 +599,11 @@ def create_user(user_id, channel_id):
 
 def send_message(data):
     """Connect Mysql database"""
-    db = pymysql.connect(config.DB_URL, config.DB_USER, config.DB_PASSWORD, config.DB_NAME, port=config.DB_PORT)
-    cursor = db.cursor()
+
+    connection_string = f'mysql+pymysql://{config.DB_USER}:{config.DB_PASSWORD}@{config.DB_URL}/{config.DB_NAME}'
+    engine = db.create_engine(connection_string)
+    connection = engine.connect()
+    metadata = db.MetaData()
 
     post = json.loads(data['data']['post'])
     channel_id = post['channel_id']
@@ -614,7 +633,7 @@ def send_message(data):
     user_id = post['user_id']
     message = dialogflow['message']
 
-    create_user(user_id, channel_id)
+    create_user(user_id, channel_id, engine, connection)
 
     if dialogflow['intent'] == 'Default Welcome Intent':
         props = {"attachments": [{
@@ -647,7 +666,7 @@ def send_message(data):
 
     elif dialogflow['intent'] == 'status_intent':
 
-        get_instance(db)
+        get_instance(engine, connection)
 
         instance_name = dialogflow['entities']['any']
 
@@ -751,7 +770,7 @@ def send_message(data):
 
     elif dialogflow['intent'] == 'scale_intent':
 
-        get_instance(db)
+        get_instance(engine, connection)
         instance_name = dialogflow['entities']['any']
         instance_type = dialogflow['entities']['any1']
 
@@ -780,15 +799,19 @@ def send_message(data):
                                     'message': "It is not valid instance type."})
                             else:
                                 permission = check_permission(user_id, instance_name, channel_id, message,
-                                                              instance_type, 'scale_instance', db)
+                                                              instance_type, 'scale_instance', engine, connection)
                                 if permission:
                                     instance_id = instance['InstanceId']
-                                    query_f = f'select name from user_botuser where user_id="{user_id}"'
-                                    cursor.execute(query_f)
-                                    user = cursor.fetchall()
+                                    table_botuser = db.Table('user_botuser', metadata, autoload=True,
+                                                             autoload_with=engine)
+                                    query_f = db.select([table_botuser.columns.name]).where(
+                                        table_botuser.columns.user_id == user_id)
+                                    resultproxy = connection.execute(query_f)
+                                    user = resultproxy.fetchall()
+
                                     requested_user = user[0][0]
                                     scale_instance(ec2client, channel_id, instance_name, instance_type, user_id,
-                                                   instance_id, requested_user, db)
+                                                   instance_id, requested_user, engine, connection)
                                 else:
                                     d.posts.create_post(options={
                                         'channel_id': channel_id,
@@ -810,14 +833,14 @@ def send_message(data):
         project_name = dialogflow['entities']['any']
 
         """Check project available or not"""
-        project_id = check_project(project_name, db)
+        project_id = check_project(project_name, engine, connection)
 
         if project_id:
 
             commit_id = dialogflow['entities']['commit']
 
             headers = {
-                'PRIVATE-TOKEN': config.GITLAB_ACCESS_TOKEN,
+                'PRIVATE-TOKEN': config.GITLAB_ACCESS_TOKEN
             }
 
             response = requests.get(f'https://gitlab.com/api/v4/projects/{project_id}/repository/commits',
@@ -1188,7 +1211,7 @@ def send_message(data):
 
     elif dialogflow['intent'] == 'start_instance intent':
 
-        get_instance(db)
+        get_instance(engine, connection)
 
         instance_name = dialogflow['entities']['any']
 
@@ -1208,15 +1231,19 @@ def send_message(data):
                             found = True
                             if instance['State']['Name'] != 'running':
                                 permission = check_permission(user_id, instance_name, channel_id, message,
-                                                              None, 'start_instance', db)
+                                                              None, 'start_instance', engine, connection)
                                 if permission:
                                     instance_id = instance['InstanceId']
-                                    query_f = f'select name from user_botuser where user_id="{user_id}"'
-                                    cursor.execute(query_f)
-                                    user = cursor.fetchall()
+                                    table_botuser = db.Table('user_botuser', metadata, autoload=True,
+                                                             autoload_with=engine)
+                                    query_f = db.select([table_botuser.columns.name]).where(
+                                        table_botuser.columns.user_id == user_id)
+                                    resultproxy = connection.execute(query_f)
+                                    user = resultproxy.fetchall()
+
                                     requested_user = user[0][0]
                                     start_instance(ec2client, channel_id, instance_name, user_id,
-                                                   instance_id, requested_user, db)
+                                                   instance_id, requested_user, engine, connection)
                                 else:
                                     d.posts.create_post(options={
                                         'channel_id': channel_id,
@@ -1240,7 +1267,7 @@ def send_message(data):
 
     elif dialogflow['intent'] == 'stop_instance intent':
 
-        get_instance(db)
+        get_instance(engine, connection)
 
         instance_name = dialogflow['entities']['any']
 
@@ -1260,15 +1287,17 @@ def send_message(data):
                             found = True
                             if instance['State']['Name'] != 'stopped':
                                 permission = check_permission(user_id, instance_name, channel_id, message,
-                                                              None, 'stop_instance', db)
+                                                              None, 'stop_instance', engine, connection)
                                 if permission:
                                     instance_id = instance['InstanceId']
-                                    query_f = f'select name from user_botuser where user_id="{user_id}"'
-                                    cursor.execute(query_f)
-                                    user = cursor.fetchall()
+                                    table_botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+                                    query_f = db.select([table_botuser.columns.name]).where(table_botuser.columns.user_id == user_id)
+                                    resultproxy = connection.execute(query_f)
+                                    user = resultproxy.fetchall()
+
                                     requested_user = user[0][0]
                                     stop_instance(ec2client, channel_id, instance_name, user_id,
-                                                  instance_id, requested_user, db)
+                                                  instance_id, requested_user, engine, connection)
                                 else:
                                     d.posts.create_post(options={
                                         'channel_id': channel_id,
@@ -1291,7 +1320,7 @@ def send_message(data):
         del i_c_p[instance_name]
 
     elif dialogflow['intent'] == 'reboot_instance intent':
-        get_instance(db)
+        get_instance(engine, connection)
 
         instance_name = dialogflow['entities']['any']
 
@@ -1311,15 +1340,19 @@ def send_message(data):
                             found = True
                             if instance['State']['Name'] == 'running':
                                 permission = check_permission(user_id, instance_name, channel_id, message,
-                                                              None, 'reboot_instance', db)
+                                                              None, 'reboot_instance', engine, connection)
                                 if permission:
                                     instance_id = instance['InstanceId']
-                                    query_f = f'select name from user_botuser where user_id="{user_id}"'
-                                    cursor.execute(query_f)
-                                    user = cursor.fetchall()
+                                    table_botuser = db.Table('user_botuser', metadata, autoload=True,
+                                                             autoload_with=engine)
+                                    query_f = db.select([table_botuser.columns.name]).where(
+                                        table_botuser.columns.user_id == user_id)
+                                    resultproxy = connection.execute(query_f)
+                                    user = resultproxy.fetchall()
+
                                     requested_user = user[0][0]
                                     reboot_instance(ec2client, channel_id, instance_name, user_id,
-                                                    instance_id, requested_user, db)
+                                                    instance_id, requested_user, engine, connection)
                                 else:
                                     d.posts.create_post(options={
                                         'channel_id': channel_id,

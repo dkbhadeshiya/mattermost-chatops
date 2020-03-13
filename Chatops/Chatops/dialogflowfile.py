@@ -2,6 +2,9 @@ import dialogflow_v2
 from Chatops import config
 import json
 from google.protobuf.json_format import MessageToJson
+import os
+
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = config.GOOGLE_APPLICATION_CREDENTIALS
 
 client = dialogflow_v2.SessionsClient()
 

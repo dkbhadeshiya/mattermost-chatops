@@ -3,9 +3,9 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
 from datetime import datetime
-import pymysql
 from Chatops import config, dialogflowfile, run
 import boto3
+import sqlalchemy as db
 
 
 @csrf_exempt
@@ -15,28 +15,36 @@ def permission(request):
         action = json.loads(data['context']['action'])
 
         """connect mysql database"""
-        db = pymysql.connect(config.DB_URL, config.DB_USER, config.DB_PASSWORD, config.DB_NAME, port=config.DB_PORT)
-        cursor = db.cursor()
+        connection_string = f'mysql+pymysql://{config.DB_USER}:{config.DB_PASSWORD}@{config.DB_URL}/{config.DB_NAME}'
+        engine = db.create_engine(connection_string)
+        connection = engine.connect()
+        metadata = db.MetaData()
 
-        query_f = f'select status from user_instanceoperation where id="{action["request_id"]}"'
-        cursor.execute(query_f)
-        db_status = cursor.fetchall()
+        table_instanceoperation = db.Table('user_instanceoperation', metadata, autoload=True, autoload_with=engine)
+        query_f = db.select([table_instanceoperation.columns.status]).where(
+            table_instanceoperation.columns.id == action['request_id'])
+        resultproxy = connection.execute(query_f)
+        db_status = resultproxy.fetchall()
 
         if db_status[0][0] == 'Pending':
             status = action['status']
 
             """get user data"""
-            query_f = f'select name,channel_id from user_botuser where id="{action["user"]}"'
-            cursor.execute(query_f)
-            user = cursor.fetchall()
+            table_botuser = db.Table('user_botuser', metadata, autoload=True, autoload_with=engine)
+            query_f = db.select([table_botuser.columns.name, table_botuser.columns.channel_id]).where(
+                table_botuser.columns.id == action['user'])
+            resultproxy = connection.execute(query_f)
+            user = resultproxy.fetchall()
 
             msg_status = ''
 
             if status == 'Accept':
-                query_u = f'update user_instanceoperation set status="Accepted", response_by_id="{action["manager_id"]}", ' \
-                          f'response_date="{datetime.utcnow()}" where id="{action["request_id"]}" '
-                cursor.execute(query_u)
-                db.commit()
+                query_u = db.update(table_instanceoperation).where(
+                    table_instanceoperation.columns.id == action['request_id']).values(status="Accepted",
+                                                                                       response_by_id=action[
+                                                                                           'manager_id'],
+                                                                                       response_date=datetime.utcnow())
+                connection.execute(query_u)
 
                 message = action['message']
 
@@ -58,7 +66,7 @@ def permission(request):
                                     if tag['Key'] == 'Name' and tag['Value'] == instance_name:
                                         instance_id = instance['InstanceId']
                                         run.scale_instance(ec2client, data['channel_id'], instance_name, instance_type,
-                                                           data['user_id'], instance_id, user[0][0], db)
+                                                           data['user_id'], instance_id, user[0][0], engine, connection)
                 else:
                     instance_name = dialogflow['entities']['any']
                     response = ec2client.describe_instances()
@@ -71,30 +79,34 @@ def permission(request):
                                             if instance['State']['Name'] != 'running':
                                                 instance_id = instance['InstanceId']
                                                 run.start_instance(ec2client, data['channel_id'], instance_name,
-                                                                   data['user_id'], instance_id, user[0][0], db)
+                                                                   data['user_id'], instance_id, user[0][0], engine, connection)
 
                                         elif action['type'] == 'stop_instance':
                                             if instance['State']['Name'] != 'stopped':
                                                 instance_id = instance['InstanceId']
                                                 run.stop_instance(ec2client, data['channel_id'], instance_name,
-                                                                  data['user_id'], instance_id, user[0][0], db)
+                                                                  data['user_id'], instance_id, user[0][0], engine, connection)
 
                                         else:
                                             if instance['State']['Name'] == 'running':
                                                 instance_id = instance['InstanceId']
                                                 run.reboot_instance(ec2client, data['channel_id'], instance_name,
-                                                                    data['user_id'], instance_id, user[0][0], db)
+                                                                    data['user_id'], instance_id, user[0][0], engine, connection)
                 msg_status = 'approved'
 
             if status == 'Reject':
-                query_u = f'update user_instanceoperation set status="Rejected", response_by_id="{action["manager_id"]}", response_date="{datetime.utcnow()}" where id="{action["request_id"]}" '
-                cursor.execute(query_u)
-                db.commit()
+                query_u = db.update(table_instanceoperation).where(
+                    table_instanceoperation.columns.id == action['request_id']).values(status="Rejected",
+                                                                                       response_by_id=action[
+                                                                                           'manager_id'],
+                                                                                       response_date=datetime.utcnow())
+                connection.execute(query_u)
 
                 """Get manager name"""
-                query_f = f'select name from user_botuser where id="{action["manager_id"]}"'
-                cursor.execute(query_f)
-                manager = cursor.fetchall()
+                query_f = db.select([table_botuser.columns.name]).where(
+                    table_botuser.columns.id == action['manager_id'])
+                resultproxy = connection.execute(query_f)
+                manager = resultproxy.fetchall()
 
                 message = action['message']
 
@@ -106,7 +118,9 @@ def permission(request):
 
                 msg_status = 'disapproved'
 
-            return JsonResponse({"update": {"message": f"> @{user[0][0]} has requested to start instance **{instance_name}**\nThe request has been {msg_status}", 'props': {'attachments': []}}})
+            return JsonResponse({"update": {
+                "message": f"> @{user[0][0]} has requested to start instance **{instance_name}**\nThe request has been {msg_status}",
+                'props': {'attachments': []}}})
         else:
             return JsonResponse({"ephemeral_text": f"The selected request is already {db_status[0][0]}"})
     else:
