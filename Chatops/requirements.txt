@@ -47,7 +47,7 @@ pyparsing==2.4.6
 python-dateutil==2.8.1
 pytz==2019.3
 requests==2.23.0
-rsa==4.0
+rsa==4.1
 s3transfer==0.3.3
 schedule==0.6.0
 service-identity==18.1.0
